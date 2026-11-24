@@ -1,84 +1,111 @@
-# IaC with AWS CloudFormation and GitHub Actions
+# AWS CloudFormation CI/CD with GitHub Actions and OIDC
 
-## Part 1: CloudFormation lab (console)
-I uploaded one template (cloudformation.yaml) twice in the CloudFormation console
-and created two independent stacks in eu-central-1 (Frankfurt):
-bongodev-ubuntu-nginx-dev (Environment=dev) and bongodev-ubuntu-nginx-test
-(Environment=test). Each stack created its own VPC, public subnet, internet
-gateway, route table, security group (HTTP 80 only) and Ubuntu 24.04 t3.micro
-instance. EC2 User Data installed Nginx and wrote the page.
+Infrastructure as Code pipeline: every push to `main` lints, validates and deploys a CloudFormation stack (VPC + Ubuntu 24.04 + Nginx on EC2) to AWS. GitHub authenticates to AWS with **OIDC short-lived credentials**, so **no AWS access keys are stored anywhere**.
 
-| Check | Development | Testing |
-|---|---|---|
-| EC2 instance ID | i-___ | i-___ |
-| VPC ID | vpc-___ | vpc-___ |
-| Website shows | Environment: dev | Environment: test |
-| Stack status | CREATE_COMPLETE | CREATE_COMPLETE |
+![IaC](https://img.shields.io/badge/IaC-CloudFormation-FF4F8B?logo=amazonaws&logoColor=white)
+![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)
+![Auth](https://img.shields.io/badge/Auth-OIDC%20(no%20keys)-2ea44f)
+![Region](https://img.shields.io/badge/Region-eu--central--1-232F3E)
 
-Both stacks were deleted afterwards (screenshot L05).
+## Architecture
 
-## Part 2: Homework (GitHub Actions + OIDC)
-Repository: https://github.com/alif-net/bongodev-cloudformation-github-actions
-Second-push commit: https://github.com/alif-net/bongodev-cloudformation-github-actions/commit/___
-Region: eu-central-1. (The README table pairs us-west-2 with N. Virginia;
-us-west-2 is Oregon and N. Virginia is us-east-1, so I used my usual region.)
+```mermaid
+flowchart LR
+    dev[Developer] -->|git push main| gh[GitHub Actions]
+    gh -->|1. cfn-lint| gh
+    gh -->|2. OIDC token| sts[AWS STS]
+    sts -->|temporary credentials ~1h| gh
+    gh -->|3. validate + deploy| cfn[CloudFormation]
+    cfn --> vpc
 
-- IAM OIDC provider token.actions.githubusercontent.com, audience sts.amazonaws.com
-- Role bongodev-github-iac-deploy-role with policy bongodev-github-iac-lab-policy
-- Trust policy restricted to this repository's main branch, using the new
-  immutable subject format (owner ID and repository ID)
-- Repository variables AWS_ROLE_ARN and AWS_REGION; no access keys stored anywhere
-- First push: workflow validated the template and created stack
-  bongodev-github-iac-dev (CREATE_COMPLETE); website shows "Hello from bongoDev!"
-- Second push: changed only the Course tag to bongoDev-DevOps-Homework-V2;
-  the stack went to UPDATE_COMPLETE and the instance ID stayed the same (i-___)
-- Cleanup: workflow disabled, stack deleted (DELETE_COMPLETE)
+    subgraph vpc[VPC 10.42.0.0/16]
+        subgraph sub[Public subnet 10.42.1.0/24]
+            ec2[EC2 t3.micro<br/>Ubuntu 24.04 + Nginx]
+        end
+    end
+    igw[Internet Gateway] --- vpc
+    user[Browser] -->|HTTP :80| igw
+```
 
-## GitHub Actions vs CloudFormation, and why OIDC
-GitHub Actions is the automation engine: on a push to main it checks out the
-repository, gets temporary AWS credentials and runs the AWS CLI commands.
-CloudFormation is the AWS service that reads the template and creates, updates
-or deletes the actual resources so they match it. OIDC lets AWS trust a signed,
-short-lived token that GitHub issues for this exact repository and branch, and
-exchange it for credentials that expire in about an hour. There are no
-long-lived access keys that could leak from the repository, logs or a laptop,
-and nothing has to be rotated.
+## What I built
 
-## Answers: CloudFormation lab
-1. IaC replaces manual clicking with a version-controlled definition, so
-   environments are repeatable, reviewable, documented and easy to delete.
-2. Parameters are inputs (Environment, AMI ID), Resources are what gets created
-   (VPC, subnet, security group, EC2), Outputs are values shown after creation
-   (WebsiteURL, InstanceId, PublicIPAddress, VpcId).
-3. A stack is one deployed instance of a template: all its resources are
-   created, updated and deleted together as one unit.
-4. Each stack creates its own resources. Same template, two stacks, two
-   independent sets of resources, so two instance IDs.
-5. Ubuntu is Debian-based and uses apt/apt-get. dnf is the package manager of
-   Fedora-based systems such as Amazon Linux 2023.
-6. Canonical is the company behind Ubuntu. It publishes the current official
-   Ubuntu AMI ID in a public SSM parameter in every region, so the template
-   needs no hard-coded, region-specific AMI ID.
-7. No. CREATE_COMPLETE means AWS created the resources. User Data then still
-   runs apt-get and starts Nginx, which can take a few more minutes.
-8. Both stacks (which removes the EC2 instances, EBS volumes, public IPs, VPCs,
-   subnets, gateways and security groups), because they cost money and an open
-   HTTP server should not run without a reason.
+- **One template, many environments.** `cloudformation.yaml` takes an `Environment` parameter. I deployed it as separate `dev` and `test` stacks from the console, each with its own isolated network.
+- **Push-to-deploy pipeline.** On every push to `main`, GitHub Actions lints the template (`cfn-lint`), validates it with AWS, and runs `aws cloudformation deploy` (create or update through a change set). Pull requests are only linted, never deployed.
+- **Keyless authentication.** An IAM OIDC identity provider trusts GitHub. The deploy role's trust policy allows only this repository's `main` branch, using GitHub's immutable owner and repository IDs.
+- **Least-privilege IAM.** The deploy role can manage only the CloudFormation, SSM and EC2 actions this stack needs ([policy](iam/deployment-policy-lab.json)).
+- **Safe updates.** Changing a tag and pushing again moved the stack to `UPDATE_COMPLETE` and kept the same EC2 instance (in-place update, no replacement).
+- **Secure defaults.** IMDSv2 is enforced (`HttpTokens: required`). The security group opens only port 80, with no SSH. The AMI comes from Canonical's public SSM parameter, so no AMI ID is hard-coded per region.
+- **Controlled teardown.** A manual `Destroy` workflow deletes the stack after you type its name to confirm.
 
-## Answers: Homework
-1. GitHub Actions runs the deployment steps; CloudFormation provisions and
-   reconciles the AWS resources to the template.
-2. The push triggers the workflow, the workflow assumes an IAM role through
-   OIDC and calls CloudFormation with the AWS CLI. Nobody needs the console.
-3. OIDC lets AWS verify a GitHub-signed token for a specific repo and branch
-   and return temporary credentials. Committed access keys are long-lived,
-   can leak and work for anyone who has them.
-4. aws cloudformation deploy creates a change set against the existing stack
-   with the same name. A new stack is only created when no stack has that name.
-5. No. CloudFormation finishes when the EC2 instance exists; Nginx is installed
-   later by User Data on first boot.
-6. User Data runs only on first boot, so changing the HTML would not change the
-   running site. A tag change is safe, visible right away and keeps the instance.
-7. Delete the stack, confirm the instance and network resources are gone,
-   disable the workflow so a push cannot recreate them, and later remove the
-   IAM role and policy when they are no longer needed.
+## Repository structure
+
+```text
+.
+├── cloudformation.yaml               # VPC, subnet, IGW, routes, SG, EC2 + Nginx (User Data)
+├── .github/workflows/
+│   ├── deploy.yml                    # lint -> OIDC -> validate -> deploy -> outputs
+│   └── destroy.yml                   # manual, confirmed stack deletion
+├── iam/
+│   ├── deployment-policy-lab.json    # permissions for the deploy role
+│   ├── trust-policy-new-repos-2026.json   # OIDC trust (immutable owner/repo IDs)
+│   └── trust-policy-legacy-repos.json     # OIDC trust (classic owner/repo format)
+└── docs/
+    └── lab-notes.md                  # detailed lab notes and Q&A
+```
+
+## How to run it
+
+**Prerequisites:** an AWS account and a fork of this repository.
+
+1. **Create the OIDC provider** in IAM → Identity providers: URL `https://token.actions.githubusercontent.com`, audience `sts.amazonaws.com`.
+2. **Create the deploy role** with a trust policy from [`iam/`](iam/) (replace the `<placeholders>`) and attach [`deployment-policy-lab.json`](iam/deployment-policy-lab.json).
+3. **Add repository variables** (Settings → Secrets and variables → Actions → Variables):
+
+   | Variable | Example |
+   |---|---|
+   | `AWS_ROLE_ARN` | `arn:aws:iam::123456789012:role/github-iac-deploy-role` |
+   | `AWS_REGION` | `eu-central-1` |
+
+4. **Push a change** to `cloudformation.yaml` on `main`, or run the **Deploy** workflow manually. The `WebsiteURL` output shows the address. Nginx needs a few minutes after `CREATE_COMPLETE` to finish installing.
+5. **Clean up:** run the **Destroy** workflow and type `bongodev-github-iac-dev` to confirm.
+
+To deploy from your own machine instead:
+
+```bash
+aws cloudformation deploy \
+  --template-file cloudformation.yaml \
+  --stack-name my-nginx-dev \
+  --parameter-overrides Environment=dev \
+  --region eu-central-1
+```
+
+## Screenshots
+
+<!-- Add images to docs/screenshots/ and uncomment:
+![Workflow run](docs/screenshots/01-workflow-success.png)
+![Stack outputs](docs/screenshots/02-stack-outputs.png)
+![Website](docs/screenshots/03-website.png)
+-->
+
+## Challenges and what I learned
+
+- **`CREATE_COMPLETE` doesn't mean the app is ready.** CloudFormation finishes when the instance exists, but User Data still installs Nginx afterwards. In a real setup I'd add a `CreationPolicy` with `cfn-signal` so the stack waits for the app.
+- **User Data runs only on first boot.** Editing the HTML in the template doesn't change a running instance. A tag change, by contrast, updates in place, which is why I used it to prove the update path.
+- **Region mismatch in the course material.** The instructions paired `us-west-2` with N. Virginia, but N. Virginia is `us-east-1`. I standardized on `eu-central-1`.
+- **OIDC subject claims are strict.** Adding a GitHub `environment:` to the job changes the token's `sub` claim, so the trust policy must match the exact claim format.
+
+## Possible improvements
+
+- Wait for the app with `CreationPolicy` + `cfn-signal`
+- Add a manual approval step before deploying to a `prod` stack
+- Serve HTTPS through an Application Load Balancer and ACM certificate
+- Rewrite the stack in Terraform with remote state in S3
+
+## Cost and security
+
+- A `t3.micro` is Free Tier eligible, but the instance and its public IPv4 address can still cost money. **Run Destroy when you're done.**
+- No credentials are committed: `.gitignore` excludes `.env`, `*.pem`, `*.key` and `.aws/`.
+
+---
+
+Built during the bongoDev DevOps bootcamp, eu-central-1 (Frankfurt), 2026.

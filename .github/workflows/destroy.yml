@@ -1,0 +1,48 @@
+# Manual teardown: deletes the stack so nothing keeps running (or costing money).
+# Run it from the Actions tab on the main branch and type the stack name to confirm.
+name: Destroy
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: "Type the stack name (bongodev-github-iac-dev) to confirm deletion"
+        required: true
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: cloudformation-dev
+  cancel-in-progress: false
+
+env:
+  STACK_NAME: bongodev-github-iac-dev
+
+jobs:
+  destroy:
+    name: Delete stack
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+    steps:
+      - name: Check confirmation
+        if: inputs.confirm != env.STACK_NAME
+        run: |
+          echo "Confirmation did not match '$STACK_NAME'. Nothing was deleted."
+          exit 1
+
+      - name: Configure temporary AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: github-iac-destroy
+
+      - name: Delete stack and wait
+        run: |
+          aws cloudformation delete-stack --stack-name "$STACK_NAME" --region "$AWS_REGION"
+          aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME" --region "$AWS_REGION"
+          echo "Stack $STACK_NAME deleted."
